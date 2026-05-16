@@ -74,6 +74,12 @@ def run(cfg):
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+    trainer_max_steps = cfg.trainer.get("max_steps")
+    if trainer_max_steps is not None and int(trainer_max_steps) > 0:
+        scheduler_max_steps = int(trainer_max_steps)
+    else:
+        scheduler_max_steps = len(train) * int(cfg.trainer.max_epochs)
+    scheduler_warmup_steps = max(1, min(1000, scheduler_max_steps // 20))
     
     ##############################
     ##       model / optim      ##
@@ -127,8 +133,12 @@ def run(cfg):
         'model_opt': {
             "modules": 'model',
             "optimizer": dict(cfg.optimizer),
-            "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
-            "interval": "epoch",
+            "scheduler": {
+                "type": "LinearWarmupCosineAnnealingLR",
+                "warmup_steps": scheduler_warmup_steps,
+                "max_steps": scheduler_max_steps,
+            },
+            "interval": "step",
         },
     }
 
