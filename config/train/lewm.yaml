@@ -10,7 +10,7 @@ train_split: 0.9
 seed: 3072
 img_size: 224
 patch_size: 14
-encoder_scale: tiny
+encoder_scale: base
 dump_object: True
 
 trainer:
@@ -26,6 +26,37 @@ loader:
   persistent_workers: True
   prefetch_factor: 3
   pin_memory: True
+
+augmentation:
+  enabled: false
+  brightness:
+    p: 0.7
+    max_delta: 0.18
+  contrast:
+    p: 0.6
+    max_delta: 0.18
+  saturation:
+    p: 0.5
+    max_delta: 0.15
+  gamma:
+    p: 0.35
+    min: 0.85
+    max: 1.2
+  noise:
+    p: 0.35
+    std_min: 0.0
+    std_max: 0.025
+  blur:
+    p: 0.12
+    kernel_size: 3
+  compression:
+    p: 0.2
+    levels_min: 48
+    levels_max: 96
+  cutout:
+    p: 0.1
+    size_frac: 0.08
+    fill: 0.0
 
 optimizer:
   type: AdamW

@@ -13,6 +13,61 @@ from omegaconf import OmegaConf, open_dict
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from lewm_training.augmentations import build_image_augmentation
+
+
+def _batch_size(batch):
+    pixels = batch.get("pixels")
+    if pixels is None or not hasattr(pixels, "shape"):
+        return None
+    return int(pixels.shape[0])
+
+
+def _stage_prefix(stage):
+    if stage in {"val", "validate", "validation"}:
+        return "val"
+    if stage in {"fit", "train", "training"}:
+        return "train"
+    return str(stage)
+
+
+def _current_lr(module):
+    trainer = getattr(module, "trainer", None)
+    optimizers = getattr(trainer, "optimizers", None)
+    if not optimizers:
+        return None
+    param_groups = getattr(optimizers[0], "param_groups", None)
+    if not param_groups:
+        return None
+    lr = param_groups[0].get("lr")
+    if lr is None:
+        return None
+    return torch.as_tensor(lr, device=module.device)
+
+
+def _extra_metrics(batch, emb, ctx_emb, tgt_emb, pred_emb, act_emb, pred_loss):
+    pred_error = pred_emb.detach() - tgt_emb.detach()
+    pred_flat = pred_emb.detach().reshape(-1, pred_emb.shape[-1])
+    tgt_flat = tgt_emb.detach().reshape(-1, tgt_emb.shape[-1])
+
+    metrics = {
+        "pred_rmse": pred_loss.detach().sqrt(),
+        "pred_abs_error": pred_error.abs().mean(),
+        "pred_target_cosine": torch.nn.functional.cosine_similarity(pred_flat, tgt_flat, dim=-1).mean(),
+        "embedding_norm": emb.detach().norm(dim=-1).mean(),
+        "context_embedding_norm": ctx_emb.detach().norm(dim=-1).mean(),
+        "target_embedding_norm": tgt_emb.detach().norm(dim=-1).mean(),
+        "pred_embedding_norm": pred_emb.detach().norm(dim=-1).mean(),
+        "action_embedding_norm": act_emb.detach().norm(dim=-1).mean(),
+    }
+
+    pixels = batch.get("pixels")
+    if pixels is not None and hasattr(pixels, "float"):
+        pixels = pixels.detach().float()
+        metrics["pixels_mean"] = pixels.mean()
+        metrics["pixels_std"] = pixels.std()
+
+    return metrics
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -39,11 +94,108 @@ def lejepa_forward(self, batch, stage, cfg):
     # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
+    output["weighted_sigreg_loss"] = lambd * output["sigreg_loss"]
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
 
-    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    losses = {k: v.detach() for k, v in output.items() if "loss" in k}
+    prefix = _stage_prefix(stage)
+    metrics = {f"{prefix}/{k}": v for k, v in losses.items()}
+    metrics.update(
+        {
+            f"{prefix}/{k}": v
+            for k, v in _extra_metrics(batch, emb, ctx_emb, tgt_emb, pred_emb, act_emb, output["pred_loss"]).items()
+        }
+    )
+    lr = _current_lr(self)
+    if lr is not None and prefix == "train":
+        metrics["train/lr"] = lr
+
+    batch_size = _batch_size(batch)
+    log_kwargs = {"logger": True, "sync_dist": True}
+    if batch_size is not None:
+        log_kwargs["batch_size"] = batch_size
+
+    if prefix == "val":
+        self.log_dict(metrics, on_step=False, on_epoch=True, prog_bar=True, **log_kwargs)
+    else:
+        self.log_dict(metrics, on_step=True, on_epoch=True, **log_kwargs)
     return output
+
+def build_train_val_transforms(dataset, cfg):
+    base_transforms = [
+        get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)
+    ]
+
+    with open_dict(cfg):
+        for col in cfg.data.dataset.keys_to_load:
+            if col.startswith("pixels"):
+                continue
+
+            normalizer = get_column_normalizer(dataset, col, col)
+            base_transforms.append(normalizer)
+
+            setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
+
+    train_transforms = []
+    augmentation = build_image_augmentation(cfg.get("augmentation"), source="pixels", target="pixels")
+    if augmentation is not None:
+        train_transforms.append(augmentation)
+    train_transforms.extend(base_transforms)
+
+    return (
+        spt.data.transforms.Compose(*train_transforms),
+        spt.data.transforms.Compose(*base_transforms),
+    )
+
+
+def build_train_val_datasets(cfg, train_transform, val_transform):
+    val_dataset_cfg = cfg.data.get("val_dataset")
+    if val_dataset_cfg is not None:
+        train_dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=train_transform)
+        merged_val_dataset_cfg = OmegaConf.merge(cfg.data.dataset, val_dataset_cfg)
+        val_dataset = swm.data.HDF5Dataset(**merged_val_dataset_cfg, transform=val_transform)
+        return train_dataset, val_dataset
+
+    split_dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+
+    rnd_gen = torch.Generator().manual_seed(cfg.seed)
+    train_idx, val_idx = spt.data.random_split(
+        split_dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+    )
+
+    train_dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=train_transform)
+    val_dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=val_transform)
+    return (
+        spt.data.Subset(train_dataset, train_idx.indices),
+        spt.data.Subset(val_dataset, val_idx.indices),
+    )
+
+
+def _resolve_checkpoint_path(path):
+    path = Path(str(path)).expanduser()
+    if path.is_absolute():
+        return path
+    return Path(swm.data.utils.get_cache_dir(), path)
+
+
+def load_initial_weights(module, cfg):
+    init_ckpt_path = cfg.get("init_ckpt_path")
+    if not init_ckpt_path:
+        return
+
+    path = _resolve_checkpoint_path(init_ckpt_path)
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    missing, unexpected = module.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:20]}")
+        if unexpected:
+            details.append(f"unexpected={unexpected[:20]}")
+        raise RuntimeError(f"Initial checkpoint did not match model: {'; '.join(details)}")
+    print(f"[train] initialized weights from {path}")
+
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
@@ -51,26 +203,11 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
-    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
-    
-    with open_dict(cfg):
-        for col in cfg.data.dataset.keys_to_load:
-            if col.startswith("pixels"):
-                continue
-
-            normalizer = get_column_normalizer(dataset, col, col)
-            transforms.append(normalizer)
-
-            setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
-
-    transform = spt.data.transforms.Compose(*transforms)
-    dataset.transform = transform
+    stats_dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    train_transform, val_transform = build_train_val_transforms(stats_dataset, cfg)
+    train_set, val_set = build_train_val_datasets(cfg, train_transform, val_transform)
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    train_set, val_set = spt.data.random_split(
-        dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
-    )
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
@@ -149,6 +286,7 @@ def run(cfg):
         forward=partial(lejepa_forward, cfg=cfg),
         optim=optimizers,
     )
+    load_initial_weights(world_model, cfg)
 
     ##########################
     ##       training       ##
